@@ -1,0 +1,26 @@
+{
+  "name": "heartbeat-signal-pwa",
+  "version": "1.0.0",
+  "description": "双人心动信号互动 PWA - 发送心动动图给TA",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "generate-vapid": "npx web-push generate-vapid-keys"
+  },
+  "keywords": [
+    "pwa",
+    "web-push",
+    "heartbeat",
+    "心动信号"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "multer": "^1.4.5-lts.1",
+    "web-push": "^3.6.7"
+  },
+  "author": ""
+}
