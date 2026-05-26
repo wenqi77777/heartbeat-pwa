@@ -23,7 +23,7 @@ import webpush from 'web-push';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ======================== 配置 ========================
@@ -41,6 +41,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const UPLOADS_DIR = join(__dirname, 'uploads');
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
+// ✅ 修改点：上传文件类型白名单集中定义，供 multer 校验和安全扩展名生成共用
+const ALLOWED_UPLOAD_MIME_TO_EXT = new Map([
+  ['image/gif', '.gif'],
+  ['image/png', '.png'],
+  ['image/jpeg', '.jpg'],
+  ['image/webp', '.webp'],
+]);
+const ALLOWED_GIF_PATHS = new Set([
+  '/heart.gif',
+  '/birthday.gif',
+  '/fireworks.gif',
+  '/miss.gif',
+]);
 
 // 确保上传目录存在
 if (!existsSync(UPLOADS_DIR)) {
@@ -54,13 +67,148 @@ webpush.setVapidDetails(VAPID_KEYS.subject, VAPID_KEYS.publicKey, VAPID_KEYS.pri
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ 修改点：Railway/反向代理环境必须信任代理，否则 req.protocol 可能一直是 http，导致推送图片 URL 不是 HTTPS
+app.set('trust proxy', 1);
+
 // 中间件
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+})); // ✅ 修改点：显式允许跨域 JSON 请求，便于自定义域名或 ?api= 调试
+app.use(express.json({ limit: '1mb' }));
+// ✅ 修改点：内置根目录 GIF 先于通用静态托管显式返回，确保 Content-Type/缓存头稳定，便于 iOS 富媒体通知直接拉取
+app.get([...ALLOWED_GIF_PATHS], (req, res, next) => {
+  const gifFilePath = join(__dirname, req.path.replace(/^\//, ''));
+
+  if (!existsSync(gifFilePath)) {
+    return next();
+  }
+
+  res.set({
+    'Content-Type': 'image/gif',
+    'Cache-Control': 'public, max-age=86400, immutable',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.sendFile(gifFilePath);
+});
+
 // 静态文件服务（前端页面）
-app.use(express.static('.'));
+app.use(express.static(__dirname, {
+  setHeaders(res, filePath) {
+    if (extname(filePath).toLowerCase() === '.gif') {
+      res.setHeader('Content-Type', 'image/gif');
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+    }
+  },
+}));
 // 上传文件可通过 /uploads/xxx 访问
 app.use('/uploads', express.static(UPLOADS_DIR));
+
+// ✅ 修改点：统一生成当前 Railway/自定义域名下的 HTTPS 站点 origin
+function getPublicOrigin(req) {
+  const forwardedProto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const protocol = forwardedProto || req.protocol || 'https';
+  const host = req.get('x-forwarded-host') || req.get('host');
+  return `${protocol}://${host}`.replace(/^http:\/\//i, 'https://');
+}
+
+// ✅ 修改点：把 /heart.gif、uploads/a.gif、heart.gif 等路径统一转换为公网可访问的绝对 HTTPS URL
+function toAbsoluteHttpsUrl(input, req) {
+  if (!input || typeof input !== 'string') return '';
+  const trimmed = input.trim();
+
+  if (/^data:/i.test(trimmed) || /^blob:/i.test(trimmed)) {
+    return '';
+  }
+
+  try {
+    const absolute = new URL(trimmed, getPublicOrigin(req));
+    if (absolute.protocol === 'http:') {
+      absolute.protocol = 'https:';
+    }
+    return absolute.toString();
+  } catch {
+    return '';
+  }
+}
+
+// 严格校验 /send-signal 使用的图片：必须是公网 HTTPS 绝对 URL，且路径只能是内置 GIF 白名单或 /uploads/ 上传文件
+function isBlockedGifHostname(hostname) {
+  const normalizedHostname = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+
+  if (normalizedHostname === 'localhost' || normalizedHostname === '127.0.0.1' || normalizedHostname === '::1') {
+    return true;
+  }
+
+  const ipv4Match = normalizedHostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!ipv4Match) {
+    return false;
+  }
+
+  const octets = ipv4Match.slice(1).map(Number);
+  if (octets.some(octet => octet < 0 || octet > 255)) {
+    return false;
+  }
+
+  const [first, second] = octets;
+  return (
+    first === 10 ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  );
+}
+
+function validateSignalGifImage(image) {
+  let url;
+
+  try {
+    url = new URL(image);
+  } catch {
+    return { error: 'GIF 路径不合法', status: 400 };
+  }
+
+  if (url.protocol !== 'https:') {
+    return { error: 'GIF 路径不合法', status: 400 };
+  }
+
+  if (isBlockedGifHostname(url.hostname)) {
+    return { error: 'GIF 路径不合法', status: 400 };
+  }
+
+  const isBuiltInGif = ALLOWED_GIF_PATHS.has(url.pathname);
+  const isUploadedGif = url.pathname.startsWith('/uploads/');
+
+  if (!isBuiltInGif && !isUploadedGif) {
+    return { error: 'GIF 路径不合法', status: 400 };
+  }
+
+  let gifFilePath;
+  if (isBuiltInGif) {
+    gifFilePath = join(__dirname, url.pathname.replace(/^\//, ''));
+  } else {
+    let uploadRelativePath;
+    try {
+      uploadRelativePath = decodeURIComponent(url.pathname.slice('/uploads/'.length));
+    } catch {
+      return { error: 'GIF 路径不合法', status: 400 };
+    }
+
+    const uploadsRoot = resolve(UPLOADS_DIR);
+    gifFilePath = resolve(uploadsRoot, uploadRelativePath);
+
+    if (gifFilePath !== uploadsRoot && !gifFilePath.startsWith(`${uploadsRoot}${sep}`)) {
+      return { error: 'GIF 路径不合法', status: 400 };
+    }
+  }
+
+  if (!existsSync(gifFilePath)) {
+    return { error: 'GIF 不存在', status: 404 };
+  }
+
+  return { url };
+}
 
 // ======================== 数据存储（文件持久化） ========================
 /**
@@ -113,8 +261,10 @@ const rateLimitMap = new Map();
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => {
-    const ext = file.originalname.split('.').pop() || 'gif';
-    const name = `${randomUUID()}.${ext}`;
+    // ✅ 修改点：扩展名不再信任 originalname，按已通过白名单的 mimetype 生成，避免伪造文件名影响静态访问
+    const fallbackExt = extname(file.originalname || '').toLowerCase();
+    const safeExt = ALLOWED_UPLOAD_MIME_TO_EXT.get(file.mimetype) || fallbackExt || '.gif';
+    const name = `${randomUUID()}${safeExt}`;
     cb(null, name);
   },
 });
@@ -123,12 +273,11 @@ const upload = multer({
   storage,
   limits: { fileSize: MAX_FILE_SIZE },
   fileFilter: (req, file, cb) => {
-    // 只允许图片/GIF 类型
-    const allowed = ['image/gif', 'image/png', 'image/jpeg', 'image/webp'];
-    if (allowed.includes(file.mimetype)) {
+    // ✅ 修改点：后端保持严格上传文件类型白名单，并返回明确 JSON 错误
+    if (ALLOWED_UPLOAD_MIME_TO_EXT.has(file.mimetype)) {
       cb(null, true);
     } else {
-      const err = new Error('仅支持 GIF/PNG/JPEG/WebP 格式');
+      const err = new Error('文件类型不支持：仅支持 GIF/PNG/JPEG/WebP');
       err.code = 'UNSUPPORTED_FILE_TYPE';
       cb(err, false);
     }
@@ -136,6 +285,15 @@ const upload = multer({
 });
 
 // ======================== API 路由 ========================
+
+// ✅ 修改点：Railway 防休眠健康检查接口，可配合 UptimeRobot / cron-job.org 每 5 分钟访问一次 https://你的域名/ping
+app.get('/ping', (req, res) => {
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    subscriptions: subscriptions.length,
+  });
+});
 
 /**
  * GET /vapid-public-key
@@ -197,10 +355,12 @@ app.post('/subscribe', (req, res) => {
 app.post('/send-signal', async (req, res) => {
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
-  // 可选认证：如果设置了 SEND_SECRET 环境变量，要求提供匹配的 secret
+  // ✅ 修改点：SEND_SECRET 支持 body.secret、?secret= 和 Authorization: Bearer xxx，未设置时保持开放可用
   if (process.env.SEND_SECRET) {
-    const { secret } = req.body;
-    if (secret !== process.env.SEND_SECRET) {
+    const authHeader = req.get('authorization') || '';
+    const bearerSecret = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+    const providedSecret = req.body?.secret || req.query?.secret || bearerSecret;
+    if (providedSecret !== process.env.SEND_SECRET) {
       console.warn(`[认证] IP ${clientIp} 提供了无效的 secret`);
       return res.status(401).json({ error: '认证失败：secret 无效' });
     }
@@ -218,11 +378,40 @@ app.post('/send-signal', async (req, res) => {
   }
   rateLimitMap.set(clientIp, now);
 
-  const { image, title, body } = req.body;
+  const { image } = req.body;
+  const gifValidation = validateSignalGifImage(image);
 
-  if (!image) {
-    return res.status(400).json({ error: '缺少 image 字段（动图URL）' });
+  if (gifValidation.error) {
+    return res.status(gifValidation.status).json({
+      error: gifValidation.error,
+    });
   }
+
+  const signalImage = gifValidation.url.toString();
+  const notificationCopies = {
+    '/heart.gif': {
+      title: '来自 TA 的消息 💌',
+      body: '有人给你递了一份心动～',
+    },
+    '/birthday.gif': {
+      title: 'Happy Birthday 🎂',
+      body: '有人给你送了一份生日祝福～',
+    },
+    '/fireworks.gif': {
+      title: '有人为你放了专属烟花🎆',
+      body: '烟火向星辰，所愿皆成真～',
+    },
+    '/miss.gif': {
+      title: '有点想你啦💕',
+      body: 'TA 的想念已送达',
+    },
+  };
+  const notificationCopy = gifValidation.url.pathname.startsWith('/uploads/')
+    ? {
+      title: '你收到一份小惊喜 ✨',
+      body: 'TA给你发了一段专属心意',
+    }
+    : notificationCopies[gifValidation.url.pathname];
 
   if (subscriptions.length === 0) {
     return res.status(200).json({
@@ -232,20 +421,30 @@ app.post('/send-signal', async (req, res) => {
     });
   }
 
+  const publicOrigin = getPublicOrigin(req);
+
   // 构建推送 payload
   const payload = JSON.stringify({
-    title: title || '来自TA的心动信号 💗',
-    body: body || 'TA给你发送了一个心动信号~',
-    image: image,                       // === iOS 16.4+ 锁屏通知显示动图的关键字段 ===
-    icon: '/icons/icon-192.png',
-    badge: '/icons/badge-96.png',
-    tag: 'heartbeat-signal',
-    data: { url: '/' },
+    title: notificationCopy.title,
+    body: notificationCopy.body,
+    image: signalImage, // ✅ 修改点：payload 必须保留前端传来的 HTTPS 绝对 URL，不自动转换、不使用默认 GIF 兜底
+    mediaUrl: signalImage,
+    'mutable-content': 1,
+    mutableContent: 1,
+    icon: toAbsoluteHttpsUrl('/icon.png', req), // ✅ 修改点：通知栏 icon 统一使用根目录新图标，并转换为公网 HTTPS 绝对 URL
+    badge: toAbsoluteHttpsUrl('/icon.png', req), // ✅ 修改点：通知 badge 不再引用旧 /icons/badge-96.png，避免缺失文件
+    tag: `heartbeat-signal-${Date.now()}`, // ✅ 修改点：使用唯一 tag，避免同 tag 通知被系统合并导致看起来只有第一次有效
+    data: {
+      url: publicOrigin + '/',
+      gifUrl: signalImage,
+      image: signalImage,
+      mediaUrl: signalImage,
+    },
     timestamp: Date.now(),
   });
 
   console.log(`[发送] 准备向 ${subscriptions.length} 个订阅发送通知`);
-  console.log(`[发送] Image URL: ${image}`);
+  console.log(`[发送] Image URL: ${signalImage}`);
 
   // 并发向所有订阅发送推送
   const results = await Promise.allSettled(
@@ -291,11 +490,15 @@ app.post('/send-signal', async (req, res) => {
     saveSubscriptions(subscriptions);
   }
 
+  const failedCount = results.length - successCount;
+
   res.json({
     success: true,
     sent: successCount,
+    failed: failedCount,
     total: results.length,
     remaining: subscriptions.length,
+    message: `推送成功 ${successCount} 个，失败 ${failedCount} 个`,
   });
 });
 
@@ -314,16 +517,30 @@ app.post('/send-signal', async (req, res) => {
  */
 app.post('/upload-image', upload.single('image'), (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: '未找到上传文件，字段名应为 image' });
+    // ✅ 修改点：无文件上传时返回可直接展示的精准 JSON 错误
+    return res.status(400).json({ error: '文件未选择：请使用字段名 image 上传图片文件' });
   }
 
-  const url = `/uploads/${req.file.filename}`;
+  const uploadPath = `/uploads/${req.file.filename}`;
+  const url = toAbsoluteHttpsUrl(uploadPath, req); // ✅ 修改点：上传后直接返回绝对 HTTPS URL，前端可直接用于通知 image
+
+  try {
+    const parsedUrl = new URL(url);
+    const isLocalHttp = parsedUrl.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsedUrl.hostname);
+    if (parsedUrl.protocol !== 'https:' && !isLocalHttp) {
+      return res.status(500).json({ error: '上传成功但生成的访问 URL 不是 HTTPS 地址' });
+    }
+  } catch {
+    return res.status(500).json({ error: '上传成功但生成的访问 URL 非法' });
+  }
 
   console.log('[上传] 文件已保存:', req.file.filename, `(${(req.file.size / 1024).toFixed(1)} KB)`);
+  console.log('[上传] 访问 URL:', url);
 
   res.json({
     success: true,
-    url: url,
+    url,
+    path: uploadPath,
     filename: req.file.filename,
     size: req.file.size,
   });
@@ -333,7 +550,10 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: '文件大小不能超过 2MB' });
+      return res.status(400).json({ error: '文件超过大小限制：不能超过 2MB' });
+    }
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: '上传字段错误：请使用字段名 image' });
     }
     return res.status(400).json({ error: `上传错误: ${err.message}` });
   }
